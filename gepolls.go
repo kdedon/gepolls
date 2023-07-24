@@ -19,23 +19,27 @@ const (
 type (
 	GEpollS struct {
 		ctx            context.Context
+		DataChan       chan DataPacket
 		netFd, epollFd int
-		svraddr        string
 		cancel         context.CancelFunc
+		clientConfig   uint32
+		clientMap      map[int]*Client
+		svraddr        string
+		seq            uint64
 		wg             sync.WaitGroup
 		logger         *slog.Logger
-		clientMap      map[int]*Client
-		DataChan       chan DataPacket
 	}
 
 	Client struct {
-		fd   int
-		Meta any
+		fd     int
+		Meta   any
+		logger *slog.Logger
 	}
 
 	DataPacket struct {
-		C *Client
-		D []byte
+		Client *Client
+		Data   []byte
+		Seq    uint64
 	}
 )
 
@@ -56,6 +60,8 @@ const (
 	EPOLLET = 1 << 31
 	// EPOLLONESHOT - fd one-shot notification, must be reset with epoll_ctl() and EPOLL_CTL_MOD
 	EPOLLONESHOT = 1 << 30
+	// DEFAULT_CLIENT_CONFIG
+	DEFAULT_CLIENT_CONFIG = uint32(EPOLLIN | EPOLLET | EPOLLRDHUP)
 )
 
 // decode takes the Events flag field and generates a pipe separated list of human readable strings
@@ -84,6 +90,28 @@ func (c *Client) Id() int {
 	return c.fd
 }
 
+func (c *Client) Write(b []byte) error {
+	total := 0
+	out := b
+
+	for {
+		if written, err := syscall.Write(c.fd, out); err != nil {
+			return fmt.Errorf("failed to write full data (%d of %d) to client: %w", written, len(b), err)
+		} else {
+			// check if the entire buffer has been written
+			if written < len(out) {
+				c.logger.Debug("partial write: %d of %d", written, len(out))
+				total += written
+				out = out[written:]
+			} else if written == len(out) {
+				total += written
+				break
+			}
+		}
+	}
+	return nil
+}
+
 func newServer(ctx context.Context) *GEpollS {
 	var lCtx context.Context
 	var cancel context.CancelFunc
@@ -96,11 +124,12 @@ func newServer(ctx context.Context) *GEpollS {
 	}
 
 	return &GEpollS{
-		ctx:       lCtx,
-		cancel:    cancel,
-		wg:        sync.WaitGroup{},
-		DataChan:  make(chan DataPacket, 1000),
-		clientMap: make(map[int]*Client),
+		ctx:          lCtx,
+		cancel:       cancel,
+		clientConfig: DEFAULT_CLIENT_CONFIG,
+		wg:           sync.WaitGroup{},
+		DataChan:     make(chan DataPacket, 1000),
+		clientMap:    make(map[int]*Client),
 	}
 }
 
@@ -111,6 +140,11 @@ func (g *GEpollS) WithHandler(h slog.Handler) *GEpollS {
 
 func (g *GEpollS) WithAddress(a string) *GEpollS {
 	g.svraddr = a
+	return g
+}
+
+func (g *GEpollS) WithDefaultClientConfig(c uint32) *GEpollS {
+	g.clientConfig = c
 	return g
 }
 
@@ -180,6 +214,18 @@ func (g *GEpollS) Stop() {
 	g.wg.Wait()
 }
 
+func (g *GEpollS) UpdateClientConfig(c *Client, config uint32) error {
+	clientEvent := &syscall.EpollEvent{
+		Events: config,
+		Fd:     int32(c.fd),
+	}
+
+	if err := syscall.EpollCtl(g.epollFd, syscall.EPOLL_CTL_MOD, c.fd, clientEvent); err != nil {
+		return fmt.Errorf("error updating client config: %w", err)
+	}
+	return nil
+}
+
 func (g *GEpollS) handleListen() {
 	defer g.wg.Done()
 	defer syscall.Close(g.netFd)
@@ -191,6 +237,7 @@ func (g *GEpollS) handleListen() {
 		select {
 		case <-g.ctx.Done():
 			g.logger.Info("exiting handler")
+			close(g.DataChan)
 			return
 		default:
 			nevents, err := syscall.EpollWait(g.epollFd, events[:], 1000)
@@ -215,13 +262,12 @@ func (g *GEpollS) handleClientSignal(fd int) {
 	var buf [32 * 1024]byte
 	nbytes, e := syscall.Read(fd, buf[:])
 	if nbytes > 0 {
-		//syscall.Write(fd, buf[:nbytes])
-
 		if c, ok := g.clientMap[fd]; !ok {
 			//TODO: better error handling here
 			g.logger.Error("signal on non-mapped client %d", fd)
 		} else {
-			g.DataChan <- DataPacket{C: c, D: buf[:nbytes]}
+			g.DataChan <- DataPacket{Client: c, Data: buf[:nbytes], Seq: g.seq}
+			g.seq++
 		}
 	} else {
 		g.logger.Info("empty receive")
@@ -246,7 +292,7 @@ func (g *GEpollS) handleClientAccept(event syscall.EpollEvent) {
 
 	// configure client and add to list of monitored fds
 	clientEvent := &syscall.EpollEvent{
-		Events: EPOLLIN | EPOLLET | EPOLLRDHUP,
+		Events: g.clientConfig,
 		Fd:     int32(connFd),
 	}
 
@@ -254,6 +300,6 @@ func (g *GEpollS) handleClientAccept(event syscall.EpollEvent) {
 		g.logger.Error("failed calling EpollCtl when adding new client", "err", err)
 	}
 
-	g.clientMap[connFd] = &Client{fd: connFd}
+	g.clientMap[connFd] = &Client{fd: connFd, logger: g.logger}
 	// add callback
 }
