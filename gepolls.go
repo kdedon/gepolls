@@ -31,9 +31,10 @@ type (
 	}
 
 	Client struct {
-		fd     int
-		Meta   any
-		logger *slog.Logger
+		fd      int
+		bufSize int
+		Meta    any
+		logger  *slog.Logger
 	}
 
 	DataPacket struct {
@@ -62,6 +63,8 @@ const (
 	EPOLLONESHOT = 1 << 30
 	// DEFAULT_CLIENT_CONFIG
 	DEFAULT_CLIENT_CONFIG = uint32(EPOLLIN | EPOLLET | EPOLLRDHUP)
+	// KB - KiloByte
+	KB = 1 << 10
 )
 
 // decode takes the Events flag field and generates a pipe separated list of human readable strings
@@ -90,13 +93,17 @@ func (c *Client) Id() int {
 	return c.fd
 }
 
-func (c *Client) Write(b []byte) error {
+func (c *Client) SetBuffSize(s int) {
+	c.bufSize = s
+}
+
+func (c *Client) WriteAll(b []byte) error {
 	total := 0
 	out := b
 
 	for {
-		if written, err := syscall.Write(c.fd, out); err != nil {
-			return fmt.Errorf("failed to write full data (%d of %d) to client: %w", written, len(b), err)
+		if written, err := c.Write(out); err != nil {
+			return fmt.Errorf("failed to write full data (%d of %d) to client %d: %w", written, len(b), c.Id(), err)
 		} else {
 			// check if the entire buffer has been written
 			if written < len(out) {
@@ -110,6 +117,14 @@ func (c *Client) Write(b []byte) error {
 		}
 	}
 	return nil
+}
+
+func (c *Client) Write(b []byte) (int, error) {
+	if written, err := syscall.Write(c.fd, b); err != nil {
+		return written, fmt.Errorf("failed to write data to client %d: %w", c.Id(), err)
+	} else {
+		return written, nil
+	}
 }
 
 func newServer(ctx context.Context) *GEpollS {
@@ -259,22 +274,23 @@ func (g *GEpollS) handleListen() {
 }
 
 func (g *GEpollS) handleClientSignal(fd int) {
-	var buf [32 * 1024]byte
-	nbytes, e := syscall.Read(fd, buf[:])
-	if nbytes > 0 {
-		if c, ok := g.clientMap[fd]; !ok {
-			//TODO: better error handling here
-			g.logger.Error("signal on non-mapped client %d", fd)
-		} else {
+	if c, ok := g.clientMap[fd]; !ok {
+		//TODO: better error handling here
+		g.logger.Error("signal on non-mapped client %d", fd)
+	} else {
+		buf := make([]byte, c.bufSize)
+		nbytes, e := syscall.Read(fd, buf)
+
+		if e != nil {
+			g.logger.Error("read error", "err", e)
+			return
+		}
+		if nbytes > 0 {
 			g.DataChan <- DataPacket{Client: c, Data: buf[:nbytes], Seq: g.seq}
 			g.seq++
+		} else {
+			g.logger.Info("empty receive")
 		}
-	} else {
-		g.logger.Info("empty receive")
-	}
-
-	if e != nil {
-		g.logger.Error("read error", "err", e)
 	}
 }
 
@@ -300,6 +316,6 @@ func (g *GEpollS) handleClientAccept(event syscall.EpollEvent) {
 		g.logger.Error("failed calling EpollCtl when adding new client", "err", err)
 	}
 
-	g.clientMap[connFd] = &Client{fd: connFd, logger: g.logger}
+	g.clientMap[connFd] = &Client{fd: connFd, logger: g.logger, bufSize: 16 * KB}
 	// add callback
 }

@@ -42,7 +42,7 @@ func TestNewServer(t *testing.T) {
 				if string(res.Data) != test {
 					t.Errorf("expected receive %s, got %s", test, string(res.Data))
 				} else {
-					if err := res.Client.Write(res.Data); err != nil {
+					if err := res.Client.WriteAll(res.Data); err != nil {
 						t.Errorf("error writing: %v", err)
 					} else {
 						conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
