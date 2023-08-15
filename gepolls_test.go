@@ -4,12 +4,11 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"testing"
 	"time"
-
-	"golang.org/x/exp/slog"
 )
 
 var tests = []string{"hello", "お早う", "☀️"}
@@ -22,14 +21,14 @@ func TestNewServer(t *testing.T) {
 
 	handler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: programLevel})
 
-	s := newServer(ctx).WithAddress("0.0.0.0:4321").WithHandler(handler)
+	s := NewServer(ctx).WithAddress("0.0.0.0:4322").WithHandler(handler)
 
 	if err := s.Start(); err != nil {
 		t.Errorf("error starting: %v", err)
 		fmt.Println(err)
 	}
 
-	if conn, err := net.Dial("tcp", "0.0.0.0:4321"); err != nil {
+	if conn, err := net.Dial("tcp", "0.0.0.0:4322"); err != nil {
 		t.Errorf("error connecting %v", err)
 	} else {
 		in := bufio.NewReader(conn)
@@ -64,6 +63,12 @@ func TestNewServer(t *testing.T) {
 			}
 		}
 		conn.Close()
+
+		sig = <-s.DataChan
+
+		if sig.Type != ClientDisconnect {
+			t.Errorf("did not get client disconnect message")
+		}
 	}
 	s.Stop()
 }

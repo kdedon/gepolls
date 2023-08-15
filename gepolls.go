@@ -3,13 +3,12 @@ package gepolls
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
 	"sync"
 	"syscall"
-
-	"golang.org/x/exp/slog"
 )
 
 const (
@@ -100,7 +99,7 @@ func (g *GEpollS) WriteAll(c int, b []byte) error {
 		} else {
 			// check if the entire buffer has been written
 			if written < len(out) {
-				g.logger.Debug("partial write: %d of %d", written, len(out))
+				g.logger.Debug(fmt.Sprintf("partial write: %d of %d", written, len(out)))
 				total += written
 				out = out[written:]
 			} else if written == len(out) {
@@ -120,7 +119,7 @@ func (g *GEpollS) Write(c int, b []byte) (int, error) {
 	}
 }
 
-func newServer(ctx context.Context) *GEpollS {
+func NewServer(ctx context.Context) *GEpollS {
 	var lCtx context.Context
 	var cancel context.CancelFunc
 
@@ -264,28 +263,49 @@ func (g *GEpollS) handleListen() {
 				if int(events[ev].Fd) == g.netFd {
 					g.handleClientAccept(events[ev])
 				} else {
-					g.logger.Debug(decode(events[ev].Events))
-					g.handleClientSignal(int(events[ev].Fd))
+					if (events[ev].Events&EPollErr == EPollErr) ||
+						(events[ev].Events&EPollHup == EPollHup) ||
+						(events[ev].Events&EPollRdHup == EPollRdHup) {
+						g.handleClientDisconnect(int(events[ev].Fd))
+					} else {
+						g.logger.Debug(decode(events[ev].Events))
+						g.handleClientSignal(int(events[ev].Fd))
+					}
 				}
 			}
 		}
 	}
 }
 
+func (g *GEpollS) handleClientDisconnect(fd int) {
+	g.DataChan <- DataPacket{Client: fd, Type: ClientDisconnect, Seq: g.seq}
+	g.seq++
+	if err := syscall.Close(fd); err != nil {
+		g.logger.Error("error when closing fd socket", "err", err)
+	}
+}
+
 func (g *GEpollS) handleClientSignal(fd int) {
 
-	buf := make([]byte, g.bufSize)
-	nbytes, e := syscall.Read(fd, buf)
+	for {
+		buf := make([]byte, g.bufSize)
+		nbytes, e := syscall.Read(fd, buf)
 
-	if e != nil {
-		g.logger.Error("read error", "err", e)
-		return
-	}
-	if nbytes > 0 {
-		g.DataChan <- DataPacket{Client: fd, Type: ClientData, Data: buf[:nbytes], Seq: g.seq}
-		g.seq++
-	} else {
-		g.logger.Info("empty receive")
+		if e != nil && e == syscall.EAGAIN {
+			return
+		} else if e != nil {
+			g.logger.Error("read error", "err", e)
+			return
+		}
+		if nbytes > 0 {
+			g.DataChan <- DataPacket{Client: fd, Type: ClientData, Data: buf[:nbytes], Seq: g.seq}
+			g.seq++
+
+		}
+		// if we read fewer than the bytes requested, assume the buffer space has been exhausted
+		if nbytes < g.bufSize {
+			return
+		}
 	}
 }
 
